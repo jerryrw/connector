@@ -1,0 +1,28 @@
+# Binaries
+netcat
+connect
+*.out
+*.exe
+
+# Object files / static libs
+*.o
+*.a
+
+# Shared libraries
+*.so
+*.dylib
+*.dll
+
+# Debug / symbol files
+*.dSYM/
+*.pdb
+
+# Build directories
+build/
+dist/
+bin/
+
+# macOS
+.DS_Store
+
+prompt.md
