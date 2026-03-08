@@ -42,16 +42,18 @@
  *   Server: ./netcat -l -i 0.0.0.0 -p 9000
  */
 
-#include "netcat.h"
+#include "connect.h"
 
 #include <arpa/inet.h>   // inet_ntop
 #include <errno.h>       // errno
 #include <netdb.h>       // getaddrinfo, freeaddrinfo, gai_strerror
 #include <netinet/in.h>  // sockaddr_in, sockaddr_in6
+#include <pthread.h>     // pthread_create, pthread_join, pthread_cancel, mutex
 #include <signal.h>      // signal, SIGPIPE
 #include <stdio.h>       // fprintf, printf, perror, fgets, fwrite, fflush
 #include <stdlib.h>      // EXIT_SUCCESS, EXIT_FAILURE, strtol
 #include <string.h>      // memset, strcmp, strerror
+#include <sys/select.h>  // select, fd_set, timeval
 #include <sys/socket.h>  // socket, bind, listen, accept, connect, recv, send, setsockopt
 #include <sys/types.h>  // socket-related type definitions
 #include <unistd.h>     // close, STDIN_FILENO, read
@@ -69,6 +71,265 @@
  */
 #define BACKLOG 16
 #define IO_BUFFER_SIZE 4096
+
+typedef struct DuplexState {
+  int sockfd;
+  pthread_mutex_t lock;
+  int stop_requested;
+  int had_error;
+} DuplexState;
+
+typedef struct ClientNode {
+  int fd;
+  struct ClientNode* next;
+} ClientNode;
+
+typedef struct ServerState {
+  pthread_mutex_t clients_lock;
+  pthread_mutex_t stdout_lock;
+  ClientNode* clients;
+} ServerState;
+
+typedef struct ClientWorkerArgs {
+  ServerState* state;
+  int client_fd;
+} ClientWorkerArgs;
+
+/* ---------- Shared state for duplex worker threads (client mode) ----------
+ *
+ * DuplexState:
+ *   Represents the state of a single client connection.
+ *   - sockfd: socket file descriptor
+ *   - lock: mutex to protect shared state
+ *   - stop_requested: flag to stop the duplex loop
+ *   - had_error: flag to indicate if an error occurred
+ *
+ * ClientNode:
+ *   Represents a client connection in the server's active client list.
+ *   - fd: file descriptor
+ *   - next: pointer to the next client in the list
+ *
+ * ServerState:
+ *   Represents the state of the server.
+ *   - clients_lock: mutex to protect the active client list
+ *   - stdout_lock: mutex to protect stdout
+ *   - clients: pointer to the head of the active client list
+ *
+ * ClientWorkerArgs:
+ *   Represents the arguments for a client worker thread.
+ *   - state: pointer to the server state
+ *   - client_fd: file descriptor of the client
+ *
+ * Thread/helper prototypes used by earlier functions:
+ *   - duplex_request_stop: stops the duplex loop
+ *   - duplex_should_stop: checks if the duplex loop should stop
+ *   - sender_thread_main: main function of the sender thread
+ *   - receiver_thread_main: main function of the receiver thread
+ *
+ * Static functions:
+ *   - send_all_fd: sends all bytes from a file descriptor
+ *   - server_add_client: adds a client to the server's active client list
+ *   - server_remove_client: removes a client from the server's active client
+ * list
+ *   - server_broadcast: broadcasts a message to all clients
+ *   - server_stdin_broadcast_main: main function of the server stdin broadcast
+ * thread
+ *   - server_client_worker_main: main function of the server client worker
+ * thread
+ *   - server_close_all_clients: closes all tracked clients
+ *
+ * Program options structure:
+ *   - listen_mode:
+ *     0 = act as client (connect)
+ *     1 = act as server (bind/listen/accept)
+ *
+ *   - ip:
+ *     Client mode: remote target IP.
+ *     Server mode: local bind IP. Defaults to 127.0.0.1 when omitted.
+ *
+ *   - port:
+ *     TCP service/port string, required in both modes.
+ *
+ * Utility functions:
+ *   - print_usage: prints user-facing CLI help
+ *   - parse_args: parses command-line arguments
+ *   - print_sockaddr: converts a generic sockaddr into numeric host:port text
+ *
+ * Important:
+ *   - Always freeaddrinfo() before returning.
+ *   - Each failed candidate fd is closed immediately.
+ */
+static void duplex_request_stop(DuplexState* st, int mark_error) {
+  if (st == NULL) return;
+  pthread_mutex_lock(&st->lock);
+  st->stop_requested = 1;
+  if (mark_error) st->had_error = 1;
+  pthread_mutex_unlock(&st->lock);
+}
+
+static int duplex_should_stop(DuplexState* st) {
+  int stop = 1;
+  if (st == NULL) return 1;
+  pthread_mutex_lock(&st->lock);
+  stop = st->stop_requested;
+  pthread_mutex_unlock(&st->lock);
+  return stop;
+}
+
+static int send_all_fd(int fd, const char* buf, size_t len) {
+  size_t off = 0;
+  while (off < len) {
+    ssize_t n = send(fd, buf + off, len - off, 0);
+    if (n > 0) {
+      off += (size_t)n;
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    return -1;
+  }
+  return 0;
+}
+
+static void* sender_thread_main(void* arg) {
+  DuplexState* st = (DuplexState*)arg;
+  char buf[IO_BUFFER_SIZE];
+
+  for (;;) {
+    if (duplex_should_stop(st)) break;
+
+    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+    if (n == 0) {
+      shutdown(st->sockfd, SHUT_WR);
+      duplex_request_stop(st, 0);
+      break;
+    }
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      duplex_request_stop(st, 1);
+      break;
+    }
+    if (send_all_fd(st->sockfd, buf, (size_t)n) != 0) {
+      duplex_request_stop(st, 1);
+      break;
+    }
+  }
+  return NULL;
+}
+
+static void* receiver_thread_main(void* arg) {
+  DuplexState* st = (DuplexState*)arg;
+  char buf[IO_BUFFER_SIZE];
+
+  for (;;) {
+    ssize_t n = recv(st->sockfd, buf, sizeof(buf), 0);
+    if (n == 0) {
+      duplex_request_stop(st, 0);
+      break;
+    }
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      duplex_request_stop(st, 1);
+      break;
+    }
+    if (fwrite(buf, 1, (size_t)n, stdout) != (size_t)n) {
+      duplex_request_stop(st, 1);
+      break;
+    }
+    fflush(stdout);
+  }
+  return NULL;
+}
+
+static void server_add_client(ServerState* st, int fd) {
+  ClientNode* n = (ClientNode*)malloc(sizeof(ClientNode));
+  if (n == NULL) return;
+  n->fd = fd;
+  pthread_mutex_lock(&st->clients_lock);
+  n->next = st->clients;
+  st->clients = n;
+  pthread_mutex_unlock(&st->clients_lock);
+}
+
+static void server_remove_client(ServerState* st, int fd) {
+  pthread_mutex_lock(&st->clients_lock);
+  ClientNode** cur = &st->clients;
+  while (*cur != NULL) {
+    if ((*cur)->fd == fd) {
+      ClientNode* dead = *cur;
+      *cur = dead->next;
+      free(dead);
+      break;
+    }
+    cur = &((*cur)->next);
+  }
+  pthread_mutex_unlock(&st->clients_lock);
+}
+
+static void server_broadcast(ServerState* st, const char* buf, size_t len) {
+  pthread_mutex_lock(&st->clients_lock);
+  for (ClientNode* n = st->clients; n != NULL; n = n->next) {
+    (void)send_all_fd(n->fd, buf, len);
+  }
+  pthread_mutex_unlock(&st->clients_lock);
+}
+
+static void* server_stdin_broadcast_main(void* arg) {
+  ServerState* st = (ServerState*)arg;
+  char buf[IO_BUFFER_SIZE];
+
+  for (;;) {
+    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+    if (n == 0) break;
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    server_broadcast(st, buf, (size_t)n);
+  }
+  return NULL;
+}
+
+static void* server_client_worker_main(void* arg) {
+  ClientWorkerArgs* wa = (ClientWorkerArgs*)arg;
+  ServerState* st = wa->state;
+  int fd = wa->client_fd;
+  char buf[IO_BUFFER_SIZE];
+  free(wa);
+
+  for (;;) {
+    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    if (n == 0) break;
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+
+    pthread_mutex_lock(&st->stdout_lock);
+    (void)fwrite(buf, 1, (size_t)n, stdout);
+    fflush(stdout);
+    pthread_mutex_unlock(&st->stdout_lock);
+
+    server_broadcast(st, buf, (size_t)n);
+  }
+
+  server_remove_client(st, fd);
+  close(fd);
+  return NULL;
+}
+
+static void server_close_all_clients(ServerState* st) {
+  pthread_mutex_lock(&st->clients_lock);
+  ClientNode* n = st->clients;
+  st->clients = NULL;
+  pthread_mutex_unlock(&st->clients_lock);
+
+  while (n != NULL) {
+    ClientNode* next = n->next;
+    close(n->fd);
+    free(n);
+    n = next;
+  }
+}
 
 /* ---------- Program options structure ----------
  *
@@ -441,154 +702,60 @@ static int create_listen_socket(const char* ip, const char* port) {
 
 /* ---------- IO loop shared by client/server once connected ----------
  *
- * Core event loop:
- *   - Wait with select() for readability on:
- *       a) socket fd
- *       b) stdin fd (while stdin still open)
- *
- *   Socket readable:
- *     recv() > 0  -> write bytes to stdout
- *     recv() == 0 -> peer performed orderly shutdown; return success
- *     recv() < 0  -> error; return failure
- *
- *   stdin readable:
- *     read() > 0  -> send all bytes to peer (loop until fully sent)
- *     read() == 0 -> local EOF:
- *                    shutdown(SHUT_WR), disable stdin monitoring,
- *                    continue receiving from peer
- *     read() < 0  -> error; return failure
- *
- * Why select():
- *   Avoids threads while still allowing simultaneous inbound/outbound traffic.
+ * Threaded design:
+ *   - sender thread:   stdin  -> socket
+ *   - receiver thread: socket -> stdout
  */
 static int run_duplex_loop(int sockfd) {
-  /* Tracks whether local stdin is still active.
-   * 1 = monitor stdin and forward input to socket.
-   * 0 = stdin reached EOF (or was intentionally closed), so stop monitoring it.
-   */
-  int stdin_open = 1;
+  DuplexState st;
+  pthread_t sender_thr;
+  pthread_t receiver_thr;
+  int sender_created = 0;
+  int receiver_created = 0;
+  int rc = -1;
 
-  /* Buffer for bytes read from local stdin before sending to peer. */
-  char inbuf[IO_BUFFER_SIZE];
+  st.sockfd = sockfd;
+  st.stop_requested = 0;
+  st.had_error = 0;
 
-  /* Buffer for bytes received from socket before printing to stdout. */
-  char sockbuf[IO_BUFFER_SIZE];
-
-  /* Main event loop:
-   * Use select() to wait for whichever input source becomes readable first.
-   */
-  for (;;) {
-    fd_set readfds; /* Read-interest set for select(). */
-    int maxfd;      /* Highest fd in readfds; select() needs maxfd + 1. */
-    int sel_rc;     /* Return code from select(). */
-
-    /* Start with an empty descriptor set each iteration. */
-    FD_ZERO(&readfds);
-
-    /* Always monitor the connected socket for incoming network data. */
-    FD_SET(sockfd, &readfds);
-    maxfd = sockfd;
-
-    /* Monitor stdin only while still open.
-     * After local EOF, stdin is removed and only socket receive continues.
-     */
-    if (stdin_open) {
-      FD_SET(STDIN_FILENO, &readfds);
-      if (STDIN_FILENO > maxfd) {
-        maxfd = STDIN_FILENO;
-      }
-    }
-
-    /* Block until at least one monitored fd is readable.
-     * Timeout is NULL -> wait indefinitely.
-     */
-    sel_rc = select(maxfd + 1, &readfds, NULL, NULL, NULL);
-
-    /* Handle select() failure.
-     * EINTR means interrupted by signal; safe to retry loop.
-     */
-    if (sel_rc < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      perror("select");
-      return -1;
-    }
-
-    /* If socket is readable, receive bytes from peer. */
-    if (FD_ISSET(sockfd, &readfds)) {
-      ssize_t n = recv(sockfd, sockbuf, sizeof(sockbuf), 0);
-
-      if (n < 0) {
-        /* recv() failed. */
-        perror("recv");
-        return -1;
-      } else if (n == 0) {
-        /* Peer performed orderly shutdown (connection closed). */
-        fprintf(stderr, "Peer closed connection.\n");
-        return 0;
-      } else {
-        /* recv() returned n bytes.
-         * Write exactly n bytes to stdout (handle partial fwrite).
-         */
-        size_t off = 0;
-        while (off < (size_t)n) {
-          size_t remaining = (size_t)n - off;
-          size_t written = fwrite(sockbuf + off, 1, remaining, stdout);
-
-          /* fwrite returning 0 indicates output failure. */
-          if (written == 0) {
-            fprintf(stderr, "Error writing to stdout.\n");
-            return -1;
-          }
-
-          off += written;
-        }
-
-        /* Force immediate display of received data. */
-        fflush(stdout);
-      }
-    }
-
-    /* If stdin is still active and readable, forward local input to socket. */
-    if (stdin_open && FD_ISSET(STDIN_FILENO, &readfds)) {
-      ssize_t n = read(STDIN_FILENO, inbuf, sizeof(inbuf));
-
-      if (n < 0) {
-        /* Local input read failure. */
-        perror("read(stdin)");
-        return -1;
-      } else if (n == 0) {
-        /* Local EOF (Ctrl-D or end of piped input).
-         * Half-close socket write side: no more outgoing data.
-         * Keep reading from peer until it closes.
-         */
-        if (shutdown(sockfd, SHUT_WR) < 0) {
-          perror("shutdown(SHUT_WR)");
-          return -1;
-        }
-
-        stdin_open = 0;
-        fprintf(stderr, "Local input closed; waiting for peer data...\n");
-      } else {
-        /* Send all n bytes to peer.
-         * send() may write fewer bytes than requested, so loop until complete.
-         */
-        size_t sent_total = 0;
-        while (sent_total < (size_t)n) {
-          ssize_t s =
-              send(sockfd, inbuf + sent_total, (size_t)n - sent_total, 0);
-
-          if (s < 0) {
-            perror("send");
-            return -1;
-          }
-
-          sent_total += (size_t)s;
-        }
-      }
-    }
+  if (pthread_mutex_init(&st.lock, NULL) != 0) {
+    fprintf(stderr, "pthread_mutex_init failed.\n");
+    return -1;
   }
+
+  if (pthread_create(&sender_thr, NULL, sender_thread_main, &st) != 0) {
+    fprintf(stderr, "pthread_create(sender) failed.\n");
+    pthread_mutex_destroy(&st.lock);
+    return -1;
+  }
+  sender_created = 1;
+
+  if (pthread_create(&receiver_thr, NULL, receiver_thread_main, &st) != 0) {
+    fprintf(stderr, "pthread_create(receiver) failed.\n");
+    duplex_request_stop(&st, 1);
+    if (sender_created) {
+      pthread_join(sender_thr, NULL);
+    }
+    pthread_mutex_destroy(&st.lock);
+    return -1;
+  }
+  receiver_created = 1;
+
+  if (receiver_created) {
+    pthread_join(receiver_thr, NULL);
+  }
+
+  /* Cooperative stop: sender checks stop flag every select() timeout. */
+  duplex_request_stop(&st, 0);
+
+  if (sender_created) {
+    pthread_join(sender_thr, NULL);
+  }
+
+  rc = (st.had_error == 0) ? 0 : -1;
+
+  pthread_mutex_destroy(&st.lock);
+  return rc;
 }
 
 /* ---------- Server accept helper ----------
@@ -685,30 +852,76 @@ static int run_client_mode(const Options* opt) {
  */
 static int run_server_mode(const Options* opt) {
   int listen_fd = -1;
-  int client_fd = -1;
-  int result = EXIT_FAILURE;
+  ServerState st;
+  pthread_t stdin_thr;
 
   listen_fd = create_listen_socket(opt->ip, opt->port);
   if (listen_fd < 0) {
-    close_if_valid(&client_fd);
+    return EXIT_FAILURE;
+  }
+
+  st.clients = NULL; /* Start with empty active-client list. */
+  if (pthread_mutex_init(&st.clients_lock, NULL) != 0) {
     close_if_valid(&listen_fd);
     return EXIT_FAILURE;
   }
 
-  client_fd = accept_one_client(listen_fd);
-  if (client_fd < 0) {
-    close_if_valid(&client_fd);
+  if (pthread_mutex_init(&st.stdout_lock, NULL) != 0) {
+    pthread_mutex_destroy(&st.clients_lock);
     close_if_valid(&listen_fd);
     return EXIT_FAILURE;
   }
 
-  if (run_duplex_loop(client_fd) == 0) {
-    result = EXIT_SUCCESS;
+  /* Optional convenience thread: server stdin is broadcast to all clients. */
+  if (pthread_create(&stdin_thr, NULL, server_stdin_broadcast_main, &st) == 0) {
+    (void)pthread_detach(stdin_thr); /* Detached: no join needed later. */
+  } else {
+    fprintf(stderr, "Warning: failed to start server stdin thread.\n");
   }
 
-  close_if_valid(&client_fd);
+  for (;;) {
+    int client_fd = accept_one_client(listen_fd);
+    if (client_fd < 0) {
+      if (errno == EINTR) {
+        continue; /* Retry accept if interrupted by signal. */
+      }
+      break; /* Hard accept failure: exit loop and clean up. */
+    }
+
+    server_add_client(&st, client_fd);
+
+    /* Per-client worker gets its own heap args to avoid stack lifetime issues.
+     */
+    ClientWorkerArgs* wa = (ClientWorkerArgs*)malloc(sizeof(ClientWorkerArgs));
+    if (wa == NULL) {
+      fprintf(stderr, "Error: out of memory for client worker args.\n");
+      server_remove_client(&st, client_fd);
+      close_if_valid(&client_fd);
+      continue;
+    }
+
+    wa->state = &st;
+    wa->client_fd = client_fd;
+
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, server_client_worker_main, wa) != 0) {
+      fprintf(stderr, "Error: pthread_create(client worker) failed.\n");
+      free(wa);
+      server_remove_client(&st, client_fd);
+      close_if_valid(&client_fd);
+      continue;
+    }
+
+    (void)pthread_detach(worker); /* Detached worker self-cleans on return. */
+  }
+
+  /* Close all tracked clients before destroying locks. */
+  server_close_all_clients(&st);
+  pthread_mutex_destroy(&st.stdout_lock);
+  pthread_mutex_destroy(&st.clients_lock);
   close_if_valid(&listen_fd);
-  return result;
+
+  return EXIT_FAILURE;
 }
 
 /* Public entrypoint used by main.c */
